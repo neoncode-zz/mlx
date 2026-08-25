@@ -59,6 +59,14 @@ MetalAllocator::MetalAllocator()
   if (is_vm) {
     return;
   }
+  // Discrete GPUs (AMD on Intel Macs) reject heaps with shared storage mode:
+  // "Heap Descriptor Validation / Shared storage mode disallowed". The heap is
+  // only an optimization for small allocations (see malloc below, which falls
+  // back to device_->newBuffer whenever heap_ is null), so skip it exactly like
+  // the paravirtual case.
+  if (!device_->hasUnifiedMemory()) {
+    return;
+  }
   auto heap_desc = MTL::HeapDescriptor::alloc()->init();
   heap_desc->setResourceOptions(resource_options);
   heap_desc->setSize(heap_size_);

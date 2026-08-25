@@ -14,12 +14,12 @@ ResidencySet::ResidencySet(MTL::Device* d) {
     wired_set_ = d->newResidencySet(desc, &error);
     desc->release();
     if (!wired_set_) {
-      std::ostringstream msg;
-      msg << "[metal::Device] Unable to construct residency set.\n";
-      if (error) {
-        msg << error->localizedDescription()->utf8String() << "\n";
-      }
-      throw std::runtime_error(msg.str());
+      // Some Metal3-capable drivers (discrete AMD GPUs on Intel Macs)
+      // advertise GPUFamilyMetal3 but do not implement residency sets.
+      // Degrade to the same no-op path used for pre-Metal3 devices: every
+      // member function is nullptr-tolerant and Device::new_queue skips
+      // addResidencySet when the set is null.
+      return;
     }
     wired_set_->requestResidency();
   }
