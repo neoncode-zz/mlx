@@ -1,6 +1,8 @@
 #pragma once
 
+#if defined(__aarch64__)
 #include <arm_neon.h>
+#endif
 #include <simd/math.h>
 #include <simd/vector.h>
 
@@ -203,11 +205,21 @@ SIMD_DEFAULT_COMPARISONS(!=)
 
 template <typename T, int N>
 Simd<T, N> clz(Simd<T, N> x) {
+#if defined(__aarch64__)
   auto a = *(uint32x4_t*)(&x);
   auto b = *((uint32x4_t*)(&x) + 1);
   a = vclzq_u32(a);
   b = vclzq_u32(b);
   return asd::make_uint8(a, b);
+#else
+  // No NEON on x86_64: count leading zeros lane by lane (clz(0) is the bit width).
+  Simd<T, N> out;
+  for (int i = 0; i < N; ++i) {
+    auto v = static_cast<uint32_t>(x[i]);
+    out[i] = v == 0 ? 32 : __builtin_clz(v);
+  }
+  return out;
+#endif
 }
 
 template <typename T, int N>

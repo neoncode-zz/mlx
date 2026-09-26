@@ -11,6 +11,10 @@
 #include "mlx/primitives.h"
 #include "mlx/utils.h"
 
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#endif
+
 namespace mlx::core {
 
 namespace {
@@ -295,12 +299,47 @@ void _qmm_dispatch_transpose(
     int K,
     bool transposed_w) {
   if (transposed_w) {
-    // the simd size must be a multiple of the number of elements per word
-    if constexpr (32 % bits == 0 && simd::max_size<T> % (32 / bits) == 0) {
-      _qmm_t_simd<T, bits, group_size>(result, x, w, scales, biases, M, N, K);
-    } else {
-      _qmm_t<T, bits, group_size>(result, x, w, scales, biases, M, N, K);
+    auto run = [&](T* r, const T* xs, const uint32_t* ws, const T* ss,
+                   const T* bs, int m, int n) {
+      // the simd size must be a multiple of the number of elements per word
+      if constexpr (32 % bits == 0 && simd::max_size<T> % (32 / bits) == 0) {
+        _qmm_t_simd<T, bits, group_size>(r, xs, ws, ss, bs, m, n, K);
+      } else {
+        _qmm_t<T, bits, group_size>(r, xs, ws, ss, bs, m, n, K);
+      }
+    };
+#ifdef __APPLE__
+    // Output rows are independent, so split N across cores. Each chunk walks
+    // every input row and writes a disjoint slice of every output row. Small
+    // products stay on the calling thread, where a dispatch would cost more
+    // than it saves.
+    constexpr int pack_factor = 32 / bits;
+    constexpr int min_chunk = 64;
+    const int64_t work = int64_t(M) * N * K;
+    const int chunks = std::min<int>(N / min_chunk, 64);
+    if (work >= (int64_t(1) << 20) && chunks > 1) {
+      const int per_chunk = (N + chunks - 1) / chunks;
+      dispatch_apply(
+          chunks,
+          dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+          ^(size_t c) {
+            const int n0 = int(c) * per_chunk;
+            const int n1 = std::min(N, n0 + per_chunk);
+            if (n0 >= n1) {
+              return;
+            }
+            const uint32_t* ws = w + int64_t(n0) * (K / pack_factor);
+            const T* ss = scales + int64_t(n0) * (K / group_size);
+            const T* bs = biases + int64_t(n0) * (K / group_size);
+            for (int m = 0; m < M; m++) {
+              run(result + int64_t(m) * N + n0, x + int64_t(m) * K, ws, ss,
+                  bs, 1, n1 - n0);
+            }
+          });
+      return;
     }
+#endif
+    run(result, x, w, scales, biases, M, N);
   } else {
     _qmm<T, bits, group_size>(result, x, w, scales, biases, M, N, K);
   }
