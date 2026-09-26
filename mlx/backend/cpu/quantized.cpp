@@ -13,6 +13,7 @@
 
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
+#include "mlx/backend/cpu/lapack.h"
 #endif
 
 namespace mlx::core {
@@ -287,6 +288,117 @@ void _qmm_t_simd(
   }
 }
 
+#ifdef __APPLE__
+// Row count from which `_qmm_t_gemm` replaces the streaming kernel.
+constexpr int qmm_gemm_min_rows = 16;
+
+// Expands `rows` quantized rows of a transposed weight into float rows of
+// length K. Mirrors the element order of `_qmm_t`: bytes are read in order and
+// each byte yields its low bits first.
+template <int bits, int group_size>
+void _dequantize_rows(
+    float* out,
+    const uint32_t* w,
+    const float* scales,
+    const float* biases,
+    int rows,
+    int K) {
+  constexpr int bitmask = (1 << bits) - 1;
+  constexpr int pack_factor = get_pack_factor(bits, 8);
+  constexpr int bytes_per_pack = get_bytes_per_pack(bits);
+  constexpr int packs_in_group = group_size / pack_factor;
+
+  const uint8_t* w_local = (const uint8_t*)w;
+  for (int r = 0; r < rows; r++) {
+    for (int k = 0; k < K; k += group_size) {
+      const float scale = *scales++;
+      const float bias = *biases++;
+      for (int kw = 0; kw < packs_in_group; kw++) {
+        if constexpr (bits == 3 || bits == 5 || bits == 6) {
+          float wl[pack_factor];
+          extract_bits<float, bits>(w_local, wl);
+#pragma clang loop unroll(full)
+          for (int p = 0; p < pack_factor; p++) {
+            *out++ = scale * wl[p] + bias;
+          }
+          w_local += bytes_per_pack;
+        } else {
+          uint8_t wi = *w_local++;
+#pragma clang loop unroll(full)
+          for (int p = 0; p < pack_factor; p++) {
+            *out++ = scale * static_cast<float>(wi & bitmask) + bias;
+            if (bits != 8) {
+              wi >>= bits;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Multi-row products (prompt prefill) are compute-bound, where the
+// cache-blocked BLAS GEMM beats streaming the packed weight once per input
+// row. The weight is expanded in bounded tiles along N, so even a
+// vocabulary-sized output projection never needs a full float copy.
+template <int bits, int group_size>
+void _qmm_t_gemm(
+    float* result,
+    const float* x,
+    const uint32_t* w,
+    const float* scales,
+    const float* biases,
+    int M,
+    int N,
+    int K) {
+  constexpr size_t tile_bytes = size_t(8) << 20;
+  constexpr int rows_per_task = 16;
+  const int64_t w_row_bytes = int64_t(K) * bits / 8;
+  const int groups_per_row = K / group_size;
+  const int tile_n = std::max(
+      rows_per_task,
+      int(tile_bytes / (sizeof(float) * size_t(K))) / rows_per_task *
+          rows_per_task);
+
+  std::vector<float> tile(size_t(std::min(tile_n, N)) * K);
+  float* tile_ptr = tile.data();
+  for (int n0 = 0; n0 < N; n0 += tile_n) {
+    const int nt = std::min(tile_n, N - n0);
+    const int tasks = (nt + rows_per_task - 1) / rows_per_task;
+    dispatch_apply(
+        tasks,
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+        ^(size_t t) {
+          const int r0 = int(t) * rows_per_task;
+          const int rows = std::min(rows_per_task, nt - r0);
+          const int64_t n = n0 + r0;
+          _dequantize_rows<bits, group_size>(
+              tile_ptr + int64_t(r0) * K,
+              (const uint32_t*)((const uint8_t*)w + n * w_row_bytes),
+              scales + n * groups_per_row,
+              biases + n * groups_per_row,
+              rows,
+              K);
+        });
+    cblas_sgemm(
+        CblasRowMajor,
+        CblasNoTrans,
+        CblasTrans,
+        M,
+        nt,
+        K,
+        1.0f,
+        x,
+        K,
+        tile_ptr,
+        K,
+        0.0f,
+        result + n0,
+        N);
+  }
+}
+#endif
+
 template <typename T, int bits, int group_size>
 void _qmm_dispatch_transpose(
     T* result,
@@ -309,6 +421,14 @@ void _qmm_dispatch_transpose(
       }
     };
 #ifdef __APPLE__
+    // Prefill: enough rows that GEMM on an expanded weight is cheaper.
+    if constexpr (std::is_same_v<T, float>) {
+      if (M >= qmm_gemm_min_rows) {
+        _qmm_t_gemm<bits, group_size>(
+            result, x, w, scales, biases, M, N, K);
+        return;
+      }
+    }
     // Output rows are independent, so split N across cores. Each chunk walks
     // every input row and writes a disjoint slice of every output row. Small
     // products stay on the calling thread, where a dispatch would cost more
