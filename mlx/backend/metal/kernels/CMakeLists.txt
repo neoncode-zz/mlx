@@ -13,6 +13,7 @@ function(build_kernel_base TARGET SRCFILE DEPS)
   set(METAL_FLAGS
       -x
       metal
+      -std=metal4.0
       -Wall
       -Wextra
       -fno-fast-math
